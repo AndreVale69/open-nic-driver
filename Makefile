@@ -22,7 +22,8 @@ endif
 
 srcdir = $(PWD)
 obj-m += onic.o
-BASE_OBJS := $(patsubst $(srcdir)/%.c,%.o,$(wildcard $(srcdir)/*.c $(srcdir)/*/*.c $(srcdir)/*/*/*.c))
+BASE_SRCS := $(filter-out $(srcdir)/tests/%,$(wildcard $(srcdir)/*.c $(srcdir)/*/*.c $(srcdir)/*/*/*.c))
+BASE_OBJS := $(patsubst $(srcdir)/%.c,%.o,$(BASE_SRCS))
 onic-objs = $(BASE_OBJS)
 ccflags-y = -O3 -Wall -Werror -I$(srcdir)/qdma_access -I$(srcdir)/hwmon -I$(srcdir)
 
@@ -36,8 +37,12 @@ with-clang:
 	
 clean:
 	make -C $(KDIR) M=$(PWD) clean
+	$(MAKE) -C tests clean
 	rm -f *.o.ur-safe
 	rm -f ./qdma_access/*.o.ur-safe
+
+check:
+	$(MAKE) -C tests check
 
 install:
 	rm -f /lib/modules/$(KERNEL_VERS)/onic.ko

@@ -22,6 +22,7 @@
 
 #include "onic.h"
 #include "onic_register.h"
+#include "qdma_csr.h"
 
 extern const char onic_drv_name[];
 extern const char onic_drv_ver[];
@@ -280,12 +281,17 @@ static void onic_get_drvinfo(struct net_device *netdev,
 			     struct ethtool_drvinfo *drvinfo)
 {
 	struct onic_private *priv = netdev_priv(netdev);
+	struct qdma_dev *qdev = (struct qdma_dev *)priv->hw.qdma;
 
 	strscpy(drvinfo->driver, onic_drv_name, sizeof(drvinfo->driver));
 	strscpy(drvinfo->version, onic_drv_ver,
 		sizeof(drvinfo->version));
 	strscpy(drvinfo->bus_info, pci_name(priv->pdev),
 		sizeof(drvinfo->bus_info));
+	if (qdev && qdev->ops)
+		snprintf(drvinfo->fw_version, sizeof(drvinfo->fw_version),
+			 "%s, prog %s", qdma_ip_gen_name(qdev->ver.gen),
+			 qdev->ops->name);
 }
 
 static u32 onic_get_link(struct net_device *netdev)

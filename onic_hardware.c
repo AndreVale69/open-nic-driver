@@ -28,9 +28,68 @@
 #define RX_ALIGN_TIMEOUT_MS			1000
 #define CMAC_RESET_WAIT_MS			1
 
+/* 0 = detect from QDMA_GLBL2_MISC_CAP, 4 = QDMA 4.0 programming,
+ * 5 = QDMA 5.0 programming
+ */
+static int qdma_ip_override;
+module_param(qdma_ip_override, int, 0444);
+MODULE_PARM_DESC(qdma_ip_override,
+		 "QDMA programming: 0=auto-detect (default), 4=force QDMA 4.0, 5=force QDMA 5.0");
+
 u16 onic_ring_count(u8 idx)
 {
 	return qdma_ring_count(idx);
+}
+
+/**
+ * qdma_select_hw - detect the QDMA IP generation and pick its programming
+ * @qdev: QDMA device with BAR-0 mapped
+ * @dev: device used for log messages
+ *
+ * Returns 0, or -ENODEV if BAR-0 does not look like the QDMA config BAR.
+ **/
+static int qdma_select_hw(struct qdma_dev *qdev, struct device *dev)
+{
+	const struct qdma_hw_version *ver = &qdev->ver;
+	enum qdma_ip_gen gen;
+	int rv;
+
+	rv = qdma_detect_version(qdev);
+	if (rv < 0) {
+		dev_err(dev, "BAR-0 is not a QDMA config BAR (block id 0x%08x)",
+			ver->block_id);
+		return rv;
+	}
+
+	gen = ver->gen;
+	dev_info(dev, "QDMA IP: %s (misc_cap 0x%08x: device type %u, ip version %u, vivado release id %u, rtl version %u)",
+		 qdma_ip_gen_name(gen), ver->misc_cap, ver->device_type,
+		 ver->ip_version, ver->vivado_release, ver->rtl_version);
+
+	switch (qdma_ip_override) {
+	case 0:
+		break;
+	case 4:
+		gen = QDMA_IP_GEN_QDMA4;
+		break;
+	case 5:
+		gen = QDMA_IP_GEN_QDMA5;
+		break;
+	default:
+		dev_warn(dev, "ignoring invalid qdma_ip_override=%d",
+			 qdma_ip_override);
+		break;
+	}
+	if (gen != ver->gen)
+		dev_warn(dev, "qdma_ip_override=%d: programming as %s, hardware reports %s",
+			 qdma_ip_override, qdma_ip_gen_name(gen),
+			 qdma_ip_gen_name(ver->gen));
+	else if (gen == QDMA_IP_GEN_UNKNOWN || gen == QDMA_IP_GEN_QDMA3)
+		dev_warn(dev, "QDMA generation not validated with this driver, using QDMA 4.0 programming");
+
+	qdev->ops = qdma_hw_ops_for_gen(gen);
+	dev_info(dev, "QDMA programming: %s", qdev->ops->name);
+	return 0;
 }
 
 static int onic_enable_cmac(struct onic_hardware *hw, u8 cmac_id)
@@ -102,6 +161,14 @@ int onic_init_hardware(struct onic_private *priv)
 	if (!qdev)
 		return -ENOMEM;
 
+	rv = qdma_select_hw(qdev, &pdev->dev);
+	if (rv < 0) {
+		qdma_destroy_dev(qdev);
+		pci_iounmap(pdev, hw->addr);
+		hw->addr = NULL;
+		return rv;
+	}
+
 	func_id = PCI_FUNC(pdev->devfn);
 	qbase = func_id * ONIC_MAX_QUEUES;
 	qmax = max(priv->num_tx_queues, priv->num_rx_queues);
@@ -131,7 +198,7 @@ int onic_init_hardware(struct onic_private *priv)
 
 	/* initialize global registers if device is a master PF */
 	if (master_pf)
-		qdma_init_global_csr_v4(qdev);
+		qdev->ops->init_global_csr(qdev);
 
     hw->qdma = (unsigned long)qdev;
 

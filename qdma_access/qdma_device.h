@@ -19,7 +19,11 @@
 
 #include <linux/pci.h>
 
+#include "qdma_version.h"
+
 #define QDMA_FLAG_FMAP		 BIT(1)
+
+struct qdma_hw_ops;
 
 struct qdma_dev {
 	struct pci_dev *pdev;
@@ -27,6 +31,8 @@ struct qdma_dev {
 	u16 q_base;
 	u16 num_queues;
 	void __iomem *addr;	/* mappaed address of device registers */
+	struct qdma_hw_version ver;	/* detected QDMA IP version */
+	const struct qdma_hw_ops *ops;	/* generation specific programming */
 };
 
 /**

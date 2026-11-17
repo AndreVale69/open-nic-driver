@@ -15,11 +15,14 @@
  * The full GNU General Public License is included in this distribution in
  * the file called "COPYING".
  */
+#include <linux/errno.h>
+
 #include "onic_common.h"
 #include "qdma_register.h"
+#include "qdma_register_v5.h"
 #include "qdma_csr.h"
 
-/* default CSR values for QDMA */
+/* default CSR values for QDMA (QDMA 4.0 programming, unchanged) */
 #define DEFAULT_MAX_DESC_FETCH			6
 #define DEFAULT_WB_INTVL			QDMA_WB_INTVL_4
 #define DEFAULT_PFCH_STOP_THRES			256
@@ -33,6 +36,51 @@
 #define DEFAULT_THROT_EN_DATA			1
 #define DEFAULT_THROT_EN_REQ			0
 #define DEFAULT_H2C_THROT_REQ_THRES		0x60
+
+/*
+ * QDMA 5.0 values.  These are the settings AMD's QDMA reference driver
+ * applies to QDMA 5.0 soft IP only (dma_ip_drivers, eqdma_soft_access.c,
+ * eqdma_set_perf_opt(), identical in releases 2023.2.1 and 2025.2), validated
+ * by AMD on QDMA 5.0 example designs.  Field positions are from
+ * qdma_v5_0_pf_registers.csv.
+ */
+#define QDMA5_DSC_CFG_C2H_UODSC_LIMIT		5
+#define QDMA5_DSC_CFG_H2C_UODSC_LIMIT		8
+#define QDMA5_DSC_CFG_MAX_DSC_FETCH		2
+#define QDMA5_DSC_CFG_WB_ACC_INT		QDMA_WB_INTVL_128
+#define QDMA5_MISC_CTL_NUM_TAG			256
+#define QDMA5_MISC_CTL_RQ_METERING_MUL		9
+#define QDMA5_PFCH_CFG_EVT_PFCH_FL_TH		256
+#define QDMA5_PFCH_CFG_PFCH_FL_TH		256
+#define QDMA5_PFCH_CFG_1_QCNT_MARGIN		4	/* cache_depth - 4 */
+#define QDMA5_PFCH_CFG_2_FENCE			1
+#define QDMA5_PFCH_CFG_2_LL_SZ_TH		1024
+#define QDMA5_PFCH_CFG_2_VAR_DESC_NUM		15
+#define QDMA5_PFCH_CFG_2_NUM			8
+#define QDMA5_PFCH_CFG_3_FL_FREE_CNT_TH		256
+#define QDMA5_PFCH_CFG_4_GLB_EVT_TIMER_TICK	64
+#define QDMA5_PFCH_CFG_4_EVT_TIMER_TICK		400
+#define QDMA5_CRDT_COAL_CFG_1_PLD_FIFO_TH	16
+#define QDMA5_CRDT_COAL_CFG_1_TIMER_TH		16
+#define QDMA5_CRDT_COAL_CFG_2_FIFO_MARGIN	8	/* cache_depth - 8 */
+#define QDMA5_CRDT_COAL_CFG_2_CNT_TH		96
+#define QDMA5_RRQ_PCIE_THROT_REQ_EN		0
+#define QDMA5_RRQ_PCIE_THROT_REQ		192
+#define QDMA5_RRQ_PCIE_THROT_DAT_EN		1
+#define QDMA5_RRQ_PCIE_THROT_DAT		20480
+#define QDMA5_RRQ_BRG_THROT_REQ_EN		1
+#define QDMA5_RRQ_BRG_THROT_REQ			QDMA5_RRQ_PCIE_THROT_REQ
+#define QDMA5_RRQ_BRG_THROT_DAT_EN		1
+#define QDMA5_H2C_THROT_PCIE_EN_REQ		1
+#define QDMA5_H2C_THROT_PCIE_REQ		QDMA5_RRQ_PCIE_THROT_REQ
+#define QDMA5_H2C_THROT_PCIE_EN_DATA		1
+#define QDMA5_H2C_THROT_PCIE_DATA		24576
+#define QDMA5_H2C_THROT_AXIMM_EN_REQ		1
+#define QDMA5_H2C_THROT_AXIMM_REQ		64
+#define QDMA5_H2C_THROT_AXIMM_EN_DATA		1
+#define QDMA5_H2C_THROT_AXIMM_DATA		16384
+#define QDMA5_H2C_MM_DATA_THROTTLE_EN		QDMA5_RRQ_PCIE_THROT_DAT_EN
+#define QDMA5_H2C_MM_DATA_THROTTLE_DAT		QDMA5_RRQ_PCIE_THROT_DAT
 
 static const u16 rngcnt_pool[QDMA_NUM_DESC_RNGCNT] = {
 	4096, 64, 128, 192, 256, 384, 512, 768,
@@ -57,6 +105,14 @@ static const u16 c2h_thres_pool[QDMA_NUM_C2H_COUNTERS] = {
 u16 qdma_ring_count(u8 idx)
 {
 	return (idx < QDMA_NUM_DESC_RNGCNT) ? rngcnt_pool[idx] : 0;
+}
+
+int qdma_detect_version(struct qdma_dev *qdev)
+{
+	u32 block_id = qdma_read_reg(qdev, QDMA_OFFSET_CONFIG_BLOCK_ID);
+	u32 misc_cap = qdma_read_reg(qdev, QDMA_OFFSET_GLBL2_MISC_CAP);
+
+	return qdma_decode_version(block_id, misc_cap, &qdev->ver);
 }
 
 /**
@@ -111,8 +167,8 @@ static void qdma_init_csr_tables(struct qdma_dev *qdev)
 /**
  * qdma_init_global_csr_v4 - QDMA 4.0 (legacy) global CSR programming
  *
- * This is the programming OpenNIC has always done (formerly
- * onic_qdma_init_csr() in onic_hardware.c), moved here unchanged.
+ * This is the programming OpenNIC has always done, moved here unchanged so
+ * that QDMA 4.0 designs see the exact same register write sequence.
  *
  * Note: QDMA_C2H_PFCH_CFG (0xB08) and QDMA_H2C_REQ_THROT (0xE24) are encoded
  * with the QDMA 3.x field layout from qdma_register.h, which does not match
@@ -185,4 +241,171 @@ void qdma_init_global_csr_v4(struct qdma_dev *qdev)
 	       FIELD_SET(QDMA_H2C_REQ_THROT_EN_REQ_MASK,
 			 DEFAULT_THROT_EN_REQ));
 	qdma_write_reg(qdev, offset, val);
+}
+
+/**
+ * qdma_init_global_csr_v5 - QDMA 5.0 global CSR programming
+ *
+ * The OpenNIC lookup tables and completion coalescing setup are the same as
+ * for 4.0 (identical register layout).  The descriptor engine, prefetch,
+ * credit coalescing and read request throttle registers are programmed with
+ * the QDMA 5.0 field layout and AMD's QDMA 5.0 values, instead of the QDMA
+ * 3.x encoded values used by the legacy path.
+ **/
+void qdma_init_global_csr_v5(struct qdma_dev *qdev)
+{
+	u32 val, depth, rrq_dat;
+
+	qdma_init_csr_tables(qdev);
+
+	/* QDMA_C2H_WRB_COAL_CFG (0xB50): same layout as 4.0, OpenNIC values */
+	val = qdma_read_reg(qdev, QDMA_OFFSET_C2H_CMPL_COAL_BUF_DEPTH);
+	val = (FIELD_SET(QDMA_C2H_TICK_CNT_MASK,
+			 DEFAULT_CMPL_COAL_TIMER_CNT) |
+	       FIELD_SET(QDMA_C2H_TICK_VAL_MASK,
+			 DEFAULT_CMPL_COAL_TIMER_TICK) |
+	       FIELD_SET(QDMA_C2H_MAX_BUF_SZ_MASK, val));
+	qdma_write_reg(qdev, QDMA_OFFSET_C2H_WB_COAL_CFG, val);
+
+	/* QDMA_GLBL_DSC_CFG (0x250): uodsc limits are new in 5.0 */
+	val = FIELD_SET(QDMA5_GLBL_DSC_CFG_C2H_UODSC_LIMIT_MASK,
+			QDMA5_DSC_CFG_C2H_UODSC_LIMIT) |
+	      FIELD_SET(QDMA5_GLBL_DSC_CFG_H2C_UODSC_LIMIT_MASK,
+			QDMA5_DSC_CFG_H2C_UODSC_LIMIT) |
+	      FIELD_SET(QDMA5_GLBL_DSC_CFG_MAX_DSC_FETCH_MASK,
+			QDMA5_DSC_CFG_MAX_DSC_FETCH) |
+	      FIELD_SET(QDMA5_GLBL_DSC_CFG_WB_ACC_INT_MASK,
+			QDMA5_DSC_CFG_WB_ACC_INT);
+	qdma_write_reg(qdev, QDMA5_OFFSET_GLBL_DSC_CFG, val);
+
+	/* Config_Block_Misc_Control (0x4C) */
+	val = FIELD_SET(QDMA5_CFG_BLK_MISC_CTL_NUM_TAG_MASK,
+			QDMA5_MISC_CTL_NUM_TAG) |
+	      FIELD_SET(QDMA5_CFG_BLK_MISC_CTL_RQ_METERING_MUL_MASK,
+			QDMA5_MISC_CTL_RQ_METERING_MUL);
+	qdma_write_reg(qdev, QDMA5_OFFSET_CFG_BLK_MISC_CTL, val);
+
+	/* QDMA_C2H_PFCH_CFG (0xB08) */
+	val = FIELD_SET(QDMA5_C2H_PFCH_CFG_EVT_PFCH_FL_TH_MASK,
+			QDMA5_PFCH_CFG_EVT_PFCH_FL_TH) |
+	      FIELD_SET(QDMA5_C2H_PFCH_CFG_PFCH_FL_TH_MASK,
+			QDMA5_PFCH_CFG_PFCH_FL_TH);
+	qdma_write_reg(qdev, QDMA5_OFFSET_C2H_PFCH_CFG, val);
+
+	/* QDMA_C2H_PFCH_CFG_1 (0xA80), sized from the prefetch tag count.
+	 * The CSV lists 8, 16, 32, 64 or 128 tags; clamp so the subtractions
+	 * below can never wrap on an unexpected value.
+	 */
+	depth = BITFIELD_GET(QDMA5_C2H_PFCH_CACHE_DEPTH_MASK,
+			     qdma_read_reg(qdev, QDMA5_OFFSET_C2H_PFCH_CACHE_DEPTH));
+	if (depth < QDMA5_CRDT_COAL_CFG_2_FIFO_MARGIN)
+		depth = QDMA5_CRDT_COAL_CFG_2_FIFO_MARGIN;
+	val = FIELD_SET(QDMA5_C2H_PFCH_CFG_1_EVT_QCNT_TH_MASK,
+			depth - QDMA5_PFCH_CFG_1_QCNT_MARGIN) |
+	      FIELD_SET(QDMA5_C2H_PFCH_CFG_1_QCNT_MASK,
+			depth - QDMA5_PFCH_CFG_1_QCNT_MARGIN);
+	qdma_write_reg(qdev, QDMA5_OFFSET_C2H_PFCH_CFG_1, val);
+
+	/* QDMA_C2H_PFCH_CFG_2 (0xA84) */
+	val = FIELD_SET(QDMA5_C2H_PFCH_CFG_2_FENCE_MASK,
+			QDMA5_PFCH_CFG_2_FENCE) |
+	      FIELD_SET(QDMA5_C2H_PFCH_CFG_2_LL_SZ_TH_MASK,
+			QDMA5_PFCH_CFG_2_LL_SZ_TH) |
+	      FIELD_SET(QDMA5_C2H_PFCH_CFG_2_VAR_DESC_NUM_MASK,
+			QDMA5_PFCH_CFG_2_VAR_DESC_NUM) |
+	      FIELD_SET(QDMA5_C2H_PFCH_CFG_2_NUM_MASK,
+			QDMA5_PFCH_CFG_2_NUM);
+	qdma_write_reg(qdev, QDMA5_OFFSET_C2H_PFCH_CFG_2, val);
+
+	/* PFCH_CFG_3 (0x147C) and PFCH_CFG_4 (0x1484), new in 5.0 */
+	val = FIELD_SET(QDMA5_PFCH_CFG_3_VAR_DESC_FL_FREE_CNT_TH_MASK,
+			QDMA5_PFCH_CFG_3_FL_FREE_CNT_TH);
+	qdma_write_reg(qdev, QDMA5_OFFSET_PFCH_CFG_3, val);
+
+	val = FIELD_SET(QDMA5_PFCH_CFG_4_GLB_EVT_TIMER_TICK_MASK,
+			QDMA5_PFCH_CFG_4_GLB_EVT_TIMER_TICK) |
+	      FIELD_SET(QDMA5_PFCH_CFG_4_EVT_TIMER_TICK_MASK,
+			QDMA5_PFCH_CFG_4_EVT_TIMER_TICK);
+	qdma_write_reg(qdev, QDMA5_OFFSET_PFCH_CFG_4, val);
+
+	/* QDMA_C2H_CRDT_COAL_CFG_1/2 (0x1400/0x1404) */
+	val = FIELD_SET(QDMA5_C2H_CRDT_COAL_CFG_1_PLD_FIFO_TH_MASK,
+			QDMA5_CRDT_COAL_CFG_1_PLD_FIFO_TH) |
+	      FIELD_SET(QDMA5_C2H_CRDT_COAL_CFG_1_TIMER_TH_MASK,
+			QDMA5_CRDT_COAL_CFG_1_TIMER_TH);
+	qdma_write_reg(qdev, QDMA5_OFFSET_C2H_CRDT_COAL_CFG_1, val);
+
+	val = FIELD_SET(QDMA5_C2H_CRDT_COAL_CFG_2_FIFO_TH_MASK,
+			depth - QDMA5_CRDT_COAL_CFG_2_FIFO_MARGIN) |
+	      FIELD_SET(QDMA5_C2H_CRDT_COAL_CFG_2_CNT_TH_MASK,
+			QDMA5_CRDT_COAL_CFG_2_CNT_TH);
+	qdma_write_reg(qdev, QDMA5_OFFSET_C2H_CRDT_COAL_CFG_2, val);
+
+	/* QDMA_GLBL2_RRQ_*_THROT (0x15C, 0x160, 0x158), new in 5.0 */
+	val = FIELD_SET(QDMA5_RRQ_THROT_REQ_EN_MASK,
+			QDMA5_RRQ_PCIE_THROT_REQ_EN) |
+	      FIELD_SET(QDMA5_RRQ_THROT_REQ_MASK, QDMA5_RRQ_PCIE_THROT_REQ) |
+	      FIELD_SET(QDMA5_RRQ_THROT_DAT_EN_MASK,
+			QDMA5_RRQ_PCIE_THROT_DAT_EN) |
+	      FIELD_SET(QDMA5_RRQ_THROT_DAT_MASK, QDMA5_RRQ_PCIE_THROT_DAT);
+	qdma_write_reg(qdev, QDMA5_OFFSET_GLBL2_RRQ_PCIE_THROT, val);
+
+	qdma_write_reg(qdev, QDMA5_OFFSET_GLBL2_RRQ_AXIMM_THROT, 0);
+
+	/* the bridge data threshold follows what the PCIe throttle accepted */
+	rrq_dat = BITFIELD_GET(QDMA5_RRQ_THROT_DAT_MASK,
+			       qdma_read_reg(qdev,
+					     QDMA5_OFFSET_GLBL2_RRQ_PCIE_THROT));
+	val = FIELD_SET(QDMA5_RRQ_THROT_REQ_EN_MASK,
+			QDMA5_RRQ_BRG_THROT_REQ_EN) |
+	      FIELD_SET(QDMA5_RRQ_THROT_REQ_MASK, QDMA5_RRQ_BRG_THROT_REQ) |
+	      FIELD_SET(QDMA5_RRQ_THROT_DAT_EN_MASK,
+			QDMA5_RRQ_BRG_THROT_DAT_EN) |
+	      FIELD_SET(QDMA5_RRQ_THROT_DAT_MASK, rrq_dat);
+	qdma_write_reg(qdev, QDMA5_OFFSET_GLBL2_RRQ_BRG_THROT, val);
+
+	/* QDMA_H2C_REQ_THROT_PCIE (0xE24) and _AXIMM (0xE2C) */
+	val = FIELD_SET(QDMA5_H2C_REQ_THROT_EN_REQ_MASK,
+			QDMA5_H2C_THROT_PCIE_EN_REQ) |
+	      FIELD_SET(QDMA5_H2C_REQ_THROT_REQ_MASK,
+			QDMA5_H2C_THROT_PCIE_REQ) |
+	      FIELD_SET(QDMA5_H2C_REQ_THROT_EN_DATA_MASK,
+			QDMA5_H2C_THROT_PCIE_EN_DATA) |
+	      FIELD_SET(QDMA5_H2C_REQ_THROT_DATA_MASK,
+			QDMA5_H2C_THROT_PCIE_DATA);
+	qdma_write_reg(qdev, QDMA5_OFFSET_H2C_REQ_THROT_PCIE, val);
+
+	val = FIELD_SET(QDMA5_H2C_REQ_THROT_EN_REQ_MASK,
+			QDMA5_H2C_THROT_AXIMM_EN_REQ) |
+	      FIELD_SET(QDMA5_H2C_REQ_THROT_REQ_MASK,
+			QDMA5_H2C_THROT_AXIMM_REQ) |
+	      FIELD_SET(QDMA5_H2C_REQ_THROT_EN_DATA_MASK,
+			QDMA5_H2C_THROT_AXIMM_EN_DATA) |
+	      FIELD_SET(QDMA5_H2C_REQ_THROT_DATA_MASK,
+			QDMA5_H2C_THROT_AXIMM_DATA);
+	qdma_write_reg(qdev, QDMA5_OFFSET_H2C_REQ_THROT_AXIMM, val);
+
+	/* QDMA_H2C_MM_Data_Throttle (0x12EC), new in 5.0 */
+	val = FIELD_SET(QDMA5_H2C_MM_DATA_THROTTLE_EN_MASK,
+			QDMA5_H2C_MM_DATA_THROTTLE_EN) |
+	      FIELD_SET(QDMA5_H2C_MM_DATA_THROTTLE_DAT_MASK,
+			QDMA5_H2C_MM_DATA_THROTTLE_DAT);
+	qdma_write_reg(qdev, QDMA5_OFFSET_H2C_MM_DATA_THROTTLE, val);
+}
+
+static const struct qdma_hw_ops qdma_hw_ops_v4 = {
+	.name = "QDMA 4.0",
+	.init_global_csr = qdma_init_global_csr_v4,
+};
+
+static const struct qdma_hw_ops qdma_hw_ops_v5 = {
+	.name = "QDMA 5.0",
+	.init_global_csr = qdma_init_global_csr_v5,
+};
+
+const struct qdma_hw_ops *qdma_hw_ops_for_gen(enum qdma_ip_gen gen)
+{
+	if (gen == QDMA_IP_GEN_QDMA5)
+		return &qdma_hw_ops_v5;
+	return &qdma_hw_ops_v4;
 }

@@ -1193,7 +1193,6 @@ int onic_xdp(struct net_device *dev, struct netdev_bpf *xdp) {
 
 int onic_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames, u32 flags) {
 	struct onic_private *priv = netdev_priv(dev);
-	struct onic_ring *tx_ring;
 	struct onic_tx_queue *tx_queue;
 	struct netdev_queue *nq;
 	int i, drops = 0, cpu;
@@ -1209,7 +1208,6 @@ int onic_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames, u32 
 		return -EINVAL;
 	}
 
-	tx_ring = &tx_queue->ring;
 	nq = netdev_get_tx_queue(tx_queue->netdev, tx_queue->qid);
 
 	__netif_tx_lock(nq, cpu);

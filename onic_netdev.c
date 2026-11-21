@@ -62,7 +62,15 @@ inline static void onic_ring_increment_tail(struct onic_ring *ring)
 	ring->next_to_clean = (ring->next_to_clean + 1) % real_count;
 }
 
-static void onic_tx_clean(struct onic_tx_queue *q)
+/**
+ * onic_tx_clean - free the TX buffers the QDMA has completed
+ * @q: TX queue
+ * @skb_only: stop at the first buffer that is not an skb.  For a NAPI poll
+ *            with a zero budget (netpoll), which may complete skbs but must
+ *            not call XDP or page pool APIs; the rest waits for the next
+ *            normal poll.
+ **/
+static void onic_tx_clean(struct onic_tx_queue *q, bool skb_only)
 {
 	struct onic_private *priv = netdev_priv(q->netdev);
 	struct onic_ring *ring = &q->ring;
@@ -88,6 +96,8 @@ static void onic_tx_clean(struct onic_tx_queue *q)
 	for (i = 0; i < work; ++i) {
 		struct onic_tx_buffer *buf = &q->buffer[ring->next_to_clean];
 
+		if (skb_only && buf->type != ONIC_TX_SKB)
+			break;
 
 		if (buf->type == ONIC_TX_SKB) {
 			// The packet originated from the kernel network stack
@@ -178,7 +188,7 @@ static int onic_xmit_xdp_ring(struct onic_private *priv,struct  onic_tx_queue  *
 
 	ring = &tx_queue->ring;
 	
-	onic_tx_clean(tx_queue);
+	onic_tx_clean(tx_queue, false);
 
 	if (onic_ring_full(ring)) {
 		if (debug)
@@ -364,7 +374,14 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 	pcpu_stats_pointer = this_cpu_ptr(priv->netdev_stats);
 
 	for (i = 0; i < priv->num_tx_queues; i++)
-		onic_tx_clean(priv->tx_queue[i]);
+		onic_tx_clean(priv->tx_queue[i], budget <= 0);
+
+	/* A zero budget (netpoll) allows skb TX completions only: no RX, no
+	 * XDP or page pool calls (the TX cleaning above stops at the first XDP
+	 * frame) and no change to the NAPI state.
+	 */
+	if (unlikely(budget <= 0))
+		return 0;
 
 	cmpl_ptr =
 		cmpl_ring->desc + QDMA_C2H_CMPL_SIZE * cmpl_ring->next_to_clean;
@@ -604,7 +621,7 @@ static void onic_clear_tx_queue(struct onic_private *priv, u16 qid)
 	if (!q)
 		return;
 
-	onic_tx_clean(q);
+	onic_tx_clean(q, false);
 
 	onic_qdma_clear_tx_queue(priv->hw.qdma, qid);
 
@@ -1040,7 +1057,7 @@ netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 	q = priv->tx_queue[qid];
 	ring = &q->ring;
 	
-	onic_tx_clean(q);
+	onic_tx_clean(q, false);
 
 	if (onic_ring_full(ring)) {
 		if (debug)

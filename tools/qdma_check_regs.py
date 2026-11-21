@@ -11,7 +11,8 @@ material and are not redistributed with this repository.
 
 For every mask the driver uses, the script checks that it covers exactly one
 field (same bit range) of the named register in the 4.0 and/or 5.0 map.  It
-also checks that the error-aggregator enable masks only set documented bits.
+also checks that the error-aggregator enable masks only set documented bits,
+apart from the listed known exceptions.
 
 Result classes:
     OK        exact match
@@ -46,6 +47,13 @@ FIELD_CHECKS = [
     ("QDMA_H2C_REQ_THROT_EN_DATA_MASK", 0xE24, "req_throt_en_data", "45", "LEGACY"),
     ("QDMA_H2C_REQ_THRESH_MASK", 0xE24, "req_throt", "45", "LEGACY"),
     ("QDMA_H2C_REQ_THROT_EN_REQ_MASK", 0xE24, "req_throt_en_req", "45", "OK"),
+    # global error aggregators: enable bits in 0x24C, status bits in 0x248
+    ("QDMA_GLBL_ERR_RAM_SBE_MASK", 0x248, "err_ram_sbe", "45", "OK"),
+    ("QDMA_GLBL_ERR_RAM_DBE_MASK", 0x248, "err_ram_dbe", "45", "OK"),
+    ("QDMA_GLBL_ERR_DSC_MASK", 0x248, "err_dsc", "45", "OK"),
+    ("QDMA_GLBL_ERR_TRQ_MASK", 0x248, "err_trq", "45", "OK"),
+    ("QDMA_GLBL_ERR_ST_C2H_MASK", 0x248, "err_c2h_st", "45", "OK"),
+    ("QDMA_GLBL_ERR_ST_H2C_MASK", 0x248, "err_h2c_st", "45", "OK"),
     ("QDMA_GLBL_ERR_FUNC_MASK", 0xB04, "Func", "45", "SUBSET"),
     ("QDMA_GLBL_ERR_VEC_MASK", 0xB04, "Vec", "45", "OK"),
     ("QDMA_GLBL_ERR_ARM_MASK", 0xB04, "Err_int_arm", "45", "OK"),
@@ -119,15 +127,20 @@ FIELD_CHECKS = [
 CMD_BITFIELDS = [("busy", 0, 0, "OK"), ("sel", 4, 1, "OK"), ("op", 6, 5, "OK"),
                  ("qid", 17, 7, "SUBSET")]
 
-# Error aggregator enable masks written by onic_qdma_init_error_interrupt()
+# Error aggregator enable masks written by onic_qdma_init_error_interrupt():
+# (macro, status register with the same layout, known undefined bits).
+# The known bits are reserved in the 4.0 and 5.0 maps but set by the inherited
+# masks, which are AMD's QDMA 3.x/4.0 ones (dma_ip_drivers qdma_soft_reg.h);
+# AMD's QDMA 5.0 code (eqdma_soft_access.c) uses masks without them.  Any
+# other undefined bit is a MISMATCH.
 ERRMASK_CHECKS = [
-    ("QDMA_GLBL_DSC_ERR_ALL_MASK", 0x254),
-    ("QDMA_GLBL_TRQ_ERR_ALL_MASK", 0x264),
-    ("QDMA_C2H_ERR_ALL_MASK", 0xAF0),
-    ("QDMA_C2H_FATAL_ERR_ALL_MASK", 0xAF8),
-    ("QDMA_H2C_ERR_ALL_MASK", 0xE00),
-    ("QDMA_SBE_ERR_ALL_MASK", 0xF4),
-    ("QDMA_DBE_ERR_ALL_MASK", 0xFC),
+    ("QDMA_GLBL_DSC_ERR_ALL_MASK", 0x254, 0x00000001),
+    ("QDMA_GLBL_TRQ_ERR_ALL_MASK", 0x264, 0x00000004),
+    ("QDMA_C2H_ERR_ALL_MASK", 0xAF0, 0x00000800),
+    ("QDMA_C2H_FATAL_ERR_ALL_MASK", 0xAF8, 0),
+    ("QDMA_H2C_ERR_ALL_MASK", 0xE00, 0),
+    ("QDMA_SBE_ERR_ALL_MASK", 0xF4, 0),
+    ("QDMA_DBE_ERR_ALL_MASK", 0xFC, 0),
 ]
 
 
@@ -245,7 +258,7 @@ def main():
             counts[got] = counts.get(got, 0) + 1
             print("%-44s 0x%05X v%s  %-8s %s" % ("qdma_ctxt_cmd." + name, 0x844, v, got, detail))
 
-    for macro, addr in ERRMASK_CHECKS:
+    for macro, addr, known in ERRMASK_CHECKS:
         mask = eval_mask(macro, macros)
         for v in "45":
             reg = maps[v].get(addr)
@@ -254,10 +267,19 @@ def main():
                 if not fname.lower().startswith(("reserved", "rsvd")):
                     defined |= ((1 << (h + 1)) - 1) & ~((1 << l) - 1)
             extra = mask & ~defined
-            res = "OK" if not extra else "LEGACY"
+            if reg is None:
+                res, detail = "MISMATCH", "register 0x%X not in map" % addr
+            elif not extra:
+                res, detail = "OK", "all set bits documented"
+            elif not extra & ~known:
+                res, detail = "LEGACY", \
+                    "bits 0x%08X reserved/undefined, known (AMD 4.0 mask)" % extra
+            else:
+                res, detail = "MISMATCH", \
+                    "bits 0x%08X set but reserved/undefined" % (extra & ~known)
+            if res == "MISMATCH":
+                unexpected += 1
             counts[res] = counts.get(res, 0) + 1
-            detail = "all set bits documented" if not extra else \
-                "bits 0x%08X set but reserved/undefined" % extra
             print("%-44s 0x%05X v%s  %-8s %s" % (macro, addr, v, res, detail))
 
     print()

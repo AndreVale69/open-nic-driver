@@ -311,6 +311,164 @@ void onic_qdma_clear_error_interrupt(unsigned long qdma)
 	qdma_write_reg(qdev, QDMA_OFFSET_GLBL_ERR_INT, 0);
 }
 
+/*
+ * Error status fields of the QDMA 4.0 and 5.0 register maps, which are
+ * identical for these registers (qdma_v4_0/v5_0_pf_registers.csv).  The
+ * per-error entries of qdma_error_info.h follow the QDMA 3.x layout, which
+ * differs for the descriptor, TRQ, H2C and RAM registers, so only their
+ * aggregate masks are used (to enable errors), not their names.  The RAM
+ * double bit error register (0xFC) has the layout of 0xF4.
+ */
+struct onic_err_field {
+	u16 reg;
+	u8 hi;
+	u8 lo;
+	const char *name;
+};
+
+static const struct onic_err_field onic_err_fields[] = {
+	{ 0x248, 17, 17, "err_fab" }, { 0x248, 16, 16, "err_h2c_st" },
+	{ 0x248, 15, 15, "err_bdg" }, { 0x248, 14, 9, "ind_ctxt_cmd_err" },
+	{ 0x248, 8, 8, "err_c2h_st" }, { 0x248, 7, 7, "err_c2h_mm_1" },
+	{ 0x248, 6, 6, "err_c2h_mm_0" }, { 0x248, 5, 5, "err_h2c_mm_1" },
+	{ 0x248, 4, 4, "err_h2c_mm_0" }, { 0x248, 3, 3, "err_trq" },
+	{ 0x248, 2, 2, "err_dsc" }, { 0x248, 1, 1, "err_ram_dbe" },
+	{ 0x248, 0, 0, "err_ram_sbe" },
+
+	{ 0x254, 25, 25, "port_id" }, { 0x254, 24, 24, "sbe" },
+	{ 0x254, 23, 23, "dbe" }, { 0x254, 22, 22, "rq_cancel" },
+	{ 0x254, 21, 21, "dsc" }, { 0x254, 20, 20, "dma" },
+	{ 0x254, 19, 19, "flr_cancel" }, { 0x254, 16, 16, "dat_poison" },
+	{ 0x254, 9, 9, "timeout" }, { 0x254, 8, 8, "flr" },
+	{ 0x254, 6, 6, "tag" }, { 0x254, 5, 5, "addr" },
+	{ 0x254, 4, 4, "param" }, { 0x254, 3, 3, "bcnt" },
+	{ 0x254, 2, 2, "ur_ca" }, { 0x254, 1, 1, "poison" },
+
+	{ 0x264, 7, 7, "tcp_qspc_timeout" }, { 0x264, 5, 5, "qid_range" },
+	{ 0x264, 4, 4, "qspc_unmapped" }, { 0x264, 3, 3, "tcp_csr_timeout" },
+	{ 0x264, 1, 1, "vf_access_err" }, { 0x264, 0, 0, "csr_unmapped" },
+
+	{ 0xAF0, 20, 20, "wrb_port_id_err" }, { 0xAF0, 19, 19, "hdr_par_err" },
+	{ 0xAF0, 18, 18, "hdr_ecc_cor_err" }, { 0xAF0, 17, 17, "hdr_ecc_unc_err" },
+	{ 0xAF0, 16, 16, "avl_ring_dsc_err" }, { 0xAF0, 15, 15, "wrb_prty_err" },
+	{ 0xAF0, 14, 14, "wrb_cidx_err" }, { 0xAF0, 13, 13, "wrb_qfull_err" },
+	{ 0xAF0, 12, 12, "wrb_inv_q_err" },
+	{ 0xAF0, 10, 10, "port_id_ctxt_mismatch" },
+	{ 0xAF0, 9, 9, "err_desc_cnt" }, { 0xAF0, 7, 7, "msi_int_fail" },
+	{ 0xAF0, 6, 6, "eng_wpl_data_par_err" }, { 0xAF0, 4, 4, "desc_rsp_err" },
+	{ 0xAF0, 3, 3, "qid_mismatch" }, { 0xAF0, 2, 2, "sh_cmpt_dsc_err" },
+	{ 0xAF0, 1, 1, "len_mismatch" }, { 0xAF0, 0, 0, "mty_mismatch" },
+
+	{ 0xAF8, 20, 20, "hdr_ecc_unc_err" },
+	{ 0xAF8, 19, 19, "avl_ring_fifo_ram_rdbe" },
+	{ 0xAF8, 18, 18, "wpl_data_par_err" },
+	{ 0xAF8, 17, 17, "payload_fifo_ram_rdbe" },
+	{ 0xAF8, 16, 16, "qid_fifo_ram_rdbe" },
+	{ 0xAF8, 15, 15, "cmpt_fifo_ram_rdbe" },
+	{ 0xAF8, 14, 14, "wrb_coal_data_ram_rdbe" },
+	{ 0xAF8, 12, 12, "int_ctxt_ram_rdbe" },
+	{ 0xAF8, 11, 11, "desc_req_fifo_ram_rdbe" },
+	{ 0xAF8, 10, 10, "pfch_ctxt_ram_rdbe" },
+	{ 0xAF8, 9, 9, "wrb_ctxt_ram_rdbe" }, { 0xAF8, 8, 8, "pfch_ll_ram_rdbe" },
+	{ 0xAF8, 7, 4, "timer_fifo_ram_rdbe" }, { 0xAF8, 3, 3, "qid_mismatch" },
+	{ 0xAF8, 1, 1, "len_mismatch" }, { 0xAF8, 0, 0, "mty_mismatch" },
+
+	{ 0xE00, 5, 5, "par_err" }, { 0xE00, 4, 4, "sbe" },
+	{ 0xE00, 3, 3, "dbe" }, { 0xE00, 2, 2, "no_dma_dsc_err" },
+	{ 0xE00, 1, 1, "sdi_mrkr_req_mop_err" },
+	{ 0xE00, 0, 0, "zero_len_dsc_err" },
+
+	{ 0x0F4, 31, 31, "rc_rrq_odd_ram" }, { 0x0F4, 30, 30, "pend_fifo_ram" },
+	{ 0x0F4, 29, 29, "pfch_ll_ram" }, { 0x0F4, 28, 28, "wrb_ctxt_ram" },
+	{ 0x0F4, 27, 27, "pfch_ctxt_ram" }, { 0x0F4, 26, 26, "desc_req_fifo_ram" },
+	{ 0x0F4, 25, 25, "int_ctxt_ram" }, { 0x0F4, 24, 24, "wrb_coal_data_ram" },
+	{ 0x0F4, 23, 23, "qid_fifo_ram" }, { 0x0F4, 22, 19, "timer_fifo_ram" },
+	{ 0x0F4, 18, 18, "mi_tl_slv_fifo_ram" }, { 0x0F4, 17, 17, "dsc_cpld" },
+	{ 0x0F4, 16, 16, "dsc_cpli" }, { 0x0F4, 15, 15, "dsc_sw_ctxt" },
+	{ 0x0F4, 14, 14, "dsc_crd_rcv" }, { 0x0F4, 13, 13, "dsc_hw_ctxt" },
+	{ 0x0F4, 12, 12, "func_map" }, { 0x0F4, 11, 11, "c2h_wr_brg_dat" },
+	{ 0x0F4, 10, 10, "c2h_rd_brg_dat" }, { 0x0F4, 9, 9, "h2c_wr_brg_dat" },
+	{ 0x0F4, 8, 8, "h2c_rd_brg_dat" }, { 0x0F4, 7, 4, "mi_c2h_dat" },
+	{ 0x0F4, 3, 0, "mi_h2c_dat" },
+};
+
+/* append " name" for every set field of status register @reg to @buf */
+static void onic_qdma_err_names(u32 reg, u32 val, char *buf, size_t len)
+{
+	u32 key = (reg == QDMA_OFFSET_RAM_DBE_STAT) ? QDMA_OFFSET_RAM_SBE_STAT : reg;
+	u32 known = 0;
+	size_t used = 0;
+	unsigned int i;
+
+	buf[0] = '\0';
+	for (i = 0; i < ARRAY_SIZE(onic_err_fields); i++) {
+		const struct onic_err_field *f = &onic_err_fields[i];
+		u32 mask = GENMASK(f->hi, f->lo);
+
+		if (f->reg != key)
+			continue;
+		known |= mask;
+		if (val & mask)
+			used += scnprintf(buf + used, len - used, " %s", f->name);
+	}
+	if (val & ~known)
+		scnprintf(buf + used, len - used, " reserved:0x%x", val & ~known);
+}
+
+u32 onic_qdma_handle_errors(unsigned long qdma)
+{
+	struct qdma_dev *qdev = (struct qdma_dev *)qdma;
+	struct device *dev = &qdev->pdev->dev;
+	char names[320];
+	u32 glbl, stat, val;
+	int i;
+
+	glbl = qdma_read_reg(qdev, QDMA_OFFSET_GLBL_ERR_STAT);
+	if (glbl) {
+		onic_qdma_err_names(QDMA_OFFSET_GLBL_ERR_STAT, glbl, names,
+				    sizeof(names));
+		dev_err_ratelimited(dev, "QDMA error: QDMA_GLBL_ERR_STAT 0x%08x:%s",
+				    glbl, names);
+	}
+
+	for (i = 0; i < NUM_LEAF_ERROR_AGGREGATORS; i++) {
+		const struct qdma_error_info *agg =
+			&qdma_error_info[leaf_error_aggregators[i]];
+
+		if (!(glbl & agg->glbl_err_mask))
+			continue;
+
+		stat = qdma_read_reg(qdev, agg->stat_reg_addr);
+		if (!stat)
+			continue;
+
+		onic_qdma_err_names(agg->stat_reg_addr, stat, names,
+				    sizeof(names));
+		dev_err_ratelimited(dev, "QDMA error: status 0x%03x = 0x%08x:%s",
+				    agg->stat_reg_addr, stat, names);
+
+		/* status registers are write-1-to-clear */
+		qdma_write_reg(qdev, agg->stat_reg_addr, stat);
+	}
+
+	if (glbl & QDMA_GLBL_ERR_ST_C2H_MASK)
+		dev_err_ratelimited(dev, "QDMA error: QDMA_C2H_FIRST_ERR_QID 0x%08x",
+				    qdma_read_reg(qdev, QDMA_OFFSET_C2H_FIRST_ERR_QID));
+	if (glbl & QDMA_GLBL_ERR_ST_H2C_MASK)
+		dev_err_ratelimited(dev, "QDMA error: QDMA_H2C_FIRST_ERR_QID 0x%08x",
+				    qdma_read_reg(qdev, QDMA_OFFSET_H2C_FIRST_ERR_QID));
+
+	if (glbl)
+		qdma_write_reg(qdev, QDMA_OFFSET_GLBL_ERR_STAT, glbl);
+
+	/* the QDMA disarms the error interrupt when it fires */
+	val = qdma_read_reg(qdev, QDMA_OFFSET_GLBL_ERR_INT);
+	val |= FIELD_SET(QDMA_GLBL_ERR_ARM_MASK, 1);
+	qdma_write_reg(qdev, QDMA_OFFSET_GLBL_ERR_INT, val);
+
+	return glbl;
+}
+
 int onic_qdma_init_tx_queue(unsigned long qdma, u16 qid,
 			    const struct onic_qdma_h2c_param *param)
 {

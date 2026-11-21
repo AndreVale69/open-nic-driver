@@ -64,9 +64,12 @@ static irqreturn_t onic_error_thread_fn(int irq, void *dev_id)
 {
 	struct onic_private *priv = dev_id;
 
-	dev_err(&priv->pdev->dev,
-		"Error IRQ (BH) fired on Funtion#%05x: vector=%d\n",
-		PCI_FUNC(priv->pdev->devfn), irq);
+	dev_err_ratelimited(&priv->pdev->dev,
+			    "Error IRQ (BH) fired on Funtion#%05x: vector=%d\n",
+			    PCI_FUNC(priv->pdev->devfn), irq);
+
+	/* decode, clear and re-arm; it used to stay disarmed after one event */
+	onic_qdma_handle_errors(priv->hw.qdma);
 
 	return IRQ_HANDLED;
 }

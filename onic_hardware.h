@@ -83,6 +83,20 @@ void onic_qdma_init_error_interrupt(unsigned long qdma, u16 vid);
 void onic_qdma_clear_error_interrupt(unsigned long qdma);
 
 /**
+ * onic_qdma_handle_errors - report, clear and re-arm QDMA errors
+ * @qdma: handle to QDMA device
+ *
+ * For the master PF's error vector.  The QDMA disarms its global error
+ * interrupt when it fires.  Log the global status and every active leaf
+ * error, clear them (write 1 to clear) and arm the interrupt again, as AMD's
+ * reference driver does (qdma_hw_error_process() and
+ * qdma_hw_error_intr_rearm()).  Called from the threaded error IRQ handler.
+ *
+ * Returns the global error status found (0 for a spurious interrupt).
+ **/
+u32 onic_qdma_handle_errors(unsigned long qdma);
+
+/**
  * onic_qdma_init_tx_queue - initialize a QDMA H2C queue
  * @qdma: handle to QDMA device
  * @qid: queue ID

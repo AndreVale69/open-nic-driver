@@ -297,7 +297,10 @@ static inline void qdma_write_reg(struct qdma_dev *qdev, u32 offset, u32 val)
 #define     QDMA_GLBL_ERR_DSC_MASK                          BIT(2)
 #define     QDMA_GLBL_ERR_TRQ_MASK                          BIT(3)
 #define     QDMA_GLBL_ERR_ST_C2H_MASK                       BIT(8)
-#define     QDMA_GLBL_ERR_ST_H2C_MASK                       BIT(11)
+/* err_h2c_st is bit 16 in the QDMA 4.0 and 5.0 maps (CSV4/CSV5, AMD
+ * eqdma_soft_reg.h); bit 11, the QDMA 3.x position, is ind_ctxt_cmd_err there
+ */
+#define     QDMA_GLBL_ERR_ST_H2C_MASK                       BIT(16)
 
 #define QDMA_OFFSET_C2H_ERR_STAT                            0xAF0
 #define QDMA_OFFSET_C2H_ERR_MASK                            0xAF4

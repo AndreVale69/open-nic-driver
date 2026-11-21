@@ -4,3 +4,4 @@
 /test_rx_poll_asan
 /test_hw
 /test_hw_asan
+/gen_bar_image

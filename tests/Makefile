@@ -8,8 +8,11 @@
 # test_rx_poll: the real onic_netdev.c RX NAPI poll against drvshim/
 # test_hw:      the real onic_hardware.c probe setup, teardown and error
 #               interrupt handling against drvshim/ and the fake BARs
+# test_reg_dump.py: tools/qdma_reg_dump.py against BAR images programmed by
+#               the driver's own CSR code (gen_bar_image)
 
 CC ?= cc
+PYTHON ?= python3
 TOP := ..
 
 QDMA_SRCS := $(TOP)/qdma_access/qdma_context.c \
@@ -17,6 +20,7 @@ QDMA_SRCS := $(TOP)/qdma_access/qdma_context.c \
 	$(TOP)/qdma_access/qdma_export.c \
 	$(TOP)/qdma_access/qdma_version.c
 SRCS := test_qdma.c fake_mmio.c legacy_csr_ref.c $(QDMA_SRCS)
+GEN_SRCS := gen_bar_image.c fake_mmio.c $(QDMA_SRCS)
 RX_SRCS := test_rx_poll.c drvshim/drvshim.c fake_mmio.c \
 	$(TOP)/onic_netdev.c $(QDMA_SRCS)
 HW_SRCS := test_hw.c drvshim/drvshim.c fake_mmio.c \
@@ -36,7 +40,7 @@ DRV_CFLAGS := -std=gnu11 -O1 -g -Wall -Werror -Wno-pointer-sign \
 
 ASAN := -fsanitize=address,undefined -fno-sanitize-recover=all
 
-PROGS := test_qdma test_rx_poll test_hw
+PROGS := test_qdma test_rx_poll test_hw gen_bar_image
 
 .PHONY: all check check-asan clean
 
@@ -47,6 +51,9 @@ test_qdma: $(SRCS) $(HDRS)
 
 test_qdma_asan: $(SRCS) $(HDRS)
 	$(CC) $(CFLAGS) $(ASAN) -o $@ $(SRCS)
+
+gen_bar_image: $(GEN_SRCS) $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(GEN_SRCS)
 
 test_rx_poll: $(RX_SRCS) $(HDRS)
 	$(CC) $(DRV_CFLAGS) -o $@ $(RX_SRCS)
@@ -64,6 +71,7 @@ check: $(PROGS)
 	./test_qdma
 	./test_rx_poll
 	./test_hw
+	$(PYTHON) -I test_reg_dump.py
 
 check-asan: test_qdma_asan test_rx_poll_asan test_hw_asan
 	./test_qdma_asan

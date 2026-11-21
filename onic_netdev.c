@@ -405,13 +405,6 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 				cmpl.color, cmpl_ring->color, color_stat);
 	}
 
-	if (cmpl.err == 1) {
-		if (debug)
-			netdev_info(q->netdev, "completion error detected in cmpl entry!");
-		// todo: need to handle the error ...
-		onic_qdma_clear_error_interrupt(priv->hw.qdma);
-	}
-
 	// main processing loop for rx_poll
 	while ((cmpl_ring->next_to_clean != cmpl_stat.pidx)) {
 		struct onic_rx_buffer *buf =
@@ -472,6 +465,19 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 
 		pcpu_stats_pointer->rx_packets++;
 		pcpu_stats_pointer->rx_bytes += len;
+
+		/* Count and report only.  This used to write 0 to
+		 * QDMA_GLBL_ERR_INT, which disabled the global error interrupt
+		 * of the master PF from any queue of any PF.
+		 */
+		if (unlikely(cmpl.err)) {
+			pcpu_stats_pointer->rx_errors++;
+			if (net_ratelimit())
+				netdev_warn(q->netdev,
+					    "C2H completion error, queue %u cidx %u pkt_id %u",
+					    qid, cmpl_ring->next_to_clean,
+					    cmpl.pkt_id);
+		}
 
 		onic_ring_increment_tail(desc_ring);
 
@@ -1127,6 +1133,7 @@ inline void onic_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *s
 		
 		total_stats.rx_packets += pcpu_ptr->rx_packets;
 		total_stats.rx_bytes += pcpu_ptr->rx_bytes;
+		total_stats.rx_errors += pcpu_ptr->rx_errors;
 		total_stats.tx_packets += pcpu_ptr->tx_packets;
 		total_stats.tx_bytes += pcpu_ptr->tx_bytes;
 		total_stats.tx_errors += pcpu_ptr->tx_errors;
@@ -1137,6 +1144,7 @@ inline void onic_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *s
 	stats->tx_bytes = total_stats.tx_bytes;
 	stats->rx_packets = total_stats.rx_packets;
 	stats->rx_bytes = total_stats.rx_bytes;
+	stats->rx_errors = total_stats.rx_errors;
 	stats->tx_dropped = total_stats.tx_dropped;
 	stats->tx_errors = total_stats.tx_errors;
 }

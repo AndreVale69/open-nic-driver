@@ -653,13 +653,6 @@ static int onic_init_tx_queue(struct onic_private *priv, u16 qid)
 	u16 vid;
 	u32 size, real_count;
 	int rv;
-	bool debug = 0;
-
-	if (priv->tx_queue[qid]) {
-		if (debug)
-			netdev_info(dev, "Re-initializing TX queue %d", qid);
-		onic_clear_tx_queue(priv, qid);
-	}
 
 	q = kzalloc(sizeof(struct onic_tx_queue), GFP_KERNEL);
 	if (!q)
@@ -714,24 +707,18 @@ static int onic_init_tx_queue(struct onic_private *priv, u16 qid)
 	return 0;
 
 clear_tx_queue:
-	onic_clear_tx_queue(priv, qid);
+	if (ring->desc)
+		dma_free_coherent(&priv->pdev->dev, size, ring->desc, ring->dma_addr);
+	kfree(q->buffer);
+	kfree(q);
 	return rv;
 }
 
-static void onic_clear_rx_queue(struct onic_private *priv, u16 qid)
+static void onic_free_rx_queue(struct onic_private *priv, struct onic_rx_queue *q)
 {
-	struct onic_rx_queue *q = priv->rx_queue[qid];
 	struct onic_ring *ring;
 	u32 size, real_count;
 	int i;
-
-	if (!q)
-		return;
-
-	onic_qdma_clear_rx_queue(priv->hw.qdma, qid);
-
-	napi_disable(&q->napi);
-	netif_napi_del(&q->napi);
 
 	ring = &q->desc_ring;
 	real_count = ring->count - 1;
@@ -751,18 +738,18 @@ static void onic_clear_rx_queue(struct onic_private *priv, u16 qid)
 		dma_free_coherent(&priv->pdev->dev, size, ring->desc,
 				  ring->dma_addr);
 
-	for (i = 0; i < real_count; ++i) {
+	for (i = 0; q->buffer && i < q->desc_ring.count - 1; ++i) {
 		struct page *pg = q->buffer[i].pg;
-		page_pool_put_full_page(q->page_pool, pg, false);
+		if (pg)
+			page_pool_put_full_page(q->page_pool, pg, false);
 	}
 
 	if (q->buffer) kfree(q->buffer);
 	if (xdp_rxq_info_is_reg(&q->xdp_rxq))
 		xdp_rxq_info_unreg(&q->xdp_rxq);
-	page_pool_destroy(q->page_pool);
-	q->page_pool = NULL;
+	if (q->page_pool)
+		page_pool_destroy(q->page_pool);
 	kfree(q);
-	priv->rx_queue[qid] = NULL;
 }
 
 
@@ -821,12 +808,6 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 	u32 size, real_count;
 	int i, rv;
 	bool debug = 0;
-
-	if (priv->rx_queue[qid]) {
-		if (debug)
-			netdev_info(dev, "Re-initializing RX queue %d", qid);
-		onic_clear_rx_queue(priv, qid);
-	}
 
 	q = kzalloc(sizeof(struct onic_rx_queue), GFP_KERNEL);
 	if (!q)
@@ -916,13 +897,6 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 	ring->next_to_clean = 0;
 	ring->color = 1;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,1,0)
-	netif_napi_add(dev, &q->napi, onic_rx_poll);
-#else
-	netif_napi_add(dev, &q->napi, onic_rx_poll, 64);
-#endif
-	napi_enable(&q->napi);
-
 	/* initialize QDMA C2H queue */
 	param.bufsz_idx = bufsz_idx;
 	param.desc_rngcnt_idx = desc_rngcnt_idx;
@@ -942,16 +916,18 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 	if (rv < 0)
 		goto clear_rx_queue;
 
-	/* fill RX descriptor ring with a few descriptors */
-	q->desc_ring.next_to_use = ONIC_RX_DESC_STEP;
-	onic_set_rx_head(priv->hw.qdma, qid, q->desc_ring.next_to_use);
-	onic_set_completion_tail(priv->hw.qdma, qid, 0, 1);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,1,0)
+	netif_napi_add(dev, &q->napi, onic_rx_poll);
+#else
+	netif_napi_add(dev, &q->napi, onic_rx_poll, 64);
+#endif
+	napi_enable(&q->napi);
 
 	priv->rx_queue[qid] = q;
 	return 0;
 
 clear_rx_queue:
-	onic_clear_rx_queue(priv, qid);
+	onic_free_rx_queue(priv, q);
 	return rv;
 }
 
@@ -966,15 +942,10 @@ static int onic_init_tx_resource(struct onic_private *priv)
 			continue;
 
 		netdev_err(dev, "onic_init_tx_queue %d, err = %d", qid, rv);
-		goto clear_tx_resource;
+		return rv;
 	}
 
 	return 0;
-
-clear_tx_resource:
-	while (qid--)
-		onic_clear_tx_queue(priv, qid);
-	return rv;
 }
 
 static int onic_init_rx_resource(struct onic_private *priv)
@@ -988,21 +959,16 @@ static int onic_init_rx_resource(struct onic_private *priv)
 			continue;
 
 		netdev_err(dev, "onic_init_rx_queue %d, err = %d", qid, rv);
-		goto clear_rx_resource;
+		return rv;
 	}
 
 	return 0;
-
-clear_rx_resource:
-	while (qid--)
-		onic_clear_rx_queue(priv, qid);
-	return rv;
 }
 
 int onic_open_netdev(struct net_device *dev)
 {
 	struct onic_private *priv = netdev_priv(dev);
-	int rv;
+	int qid, rv;
 
 	rv = onic_init_tx_resource(priv);
 	if (rv < 0)
@@ -1012,6 +978,17 @@ int onic_open_netdev(struct net_device *dev)
 	if (rv < 0)
 		goto stop_netdev;
 
+	for (qid = 0; qid < priv->num_rx_queues; ++qid) {
+		priv->rx_queue[qid]->desc_ring.next_to_use = ONIC_RX_DESC_STEP;
+		onic_set_rx_head(priv->hw.qdma, qid, ONIC_RX_DESC_STEP);
+		onic_set_completion_tail(priv->hw.qdma, qid, 0, 1);
+	}
+	/* Every initial doorbell is complete. Service any IRQ that arrived
+	 * while the handler was gated, including a pending one on reopen.
+	 */
+	smp_store_release(&priv->queues_ready, true);
+	for (qid = 0; qid < priv->num_rx_queues; ++qid)
+		napi_schedule(&priv->rx_queue[qid]->napi);
 	netif_tx_start_all_queues(dev);
 	netif_carrier_on(dev);
 	return 0;
@@ -1028,12 +1005,29 @@ int onic_stop_netdev(struct net_device *dev)
 
 	/* stop sending */
 	netif_carrier_off(dev);
-	netif_tx_stop_all_queues(dev);
+	netif_tx_disable(dev);
+	smp_store_release(&priv->queues_ready, false);
+	for (qid = 0; qid < priv->num_q_vectors; ++qid)
+		synchronize_irq(pci_irq_vector(priv->pdev, qid));
+	for (qid = 0; qid < priv->num_rx_queues; ++qid)
+		if (priv->rx_queue[qid])
+			napi_disable(&priv->rx_queue[qid]->napi);
+
+	/* Drain XDP transmit and polls finishing after napi_complete_done(). */
+	synchronize_net();
 
 	for (qid = 0; qid < priv->num_tx_queues; ++qid)
 		onic_clear_tx_queue(priv, qid);
-	for (qid = 0; qid < priv->num_rx_queues; ++qid)
-		onic_clear_rx_queue(priv, qid);
+	for (qid = 0; qid < priv->num_rx_queues; ++qid) {
+		struct onic_rx_queue *q = priv->rx_queue[qid];
+
+		if (!q)
+			continue;
+		netif_napi_del(&q->napi);
+		onic_qdma_clear_rx_queue(priv->hw.qdma, qid);
+		onic_free_rx_queue(priv, q);
+		priv->rx_queue[qid] = NULL;
+	}
 
 	return 0;
 }
@@ -1220,6 +1214,8 @@ int onic_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames, u32 
 	int i, drops = 0, cpu;
 	
 	 
+	if (!smp_load_acquire(&priv->queues_ready))
+		return -ENETDOWN;
 	cpu  = smp_processor_id();
 
 	tx_queue =  onic_xdp_tx_queue_mapping(priv);

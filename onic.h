@@ -136,6 +136,7 @@ struct onic_private {
 
         int RS_FEC;
 
+	bool queues_ready;
 	u16 num_q_vectors;
 	u16 num_tx_queues;
 	u16 num_rx_queues;

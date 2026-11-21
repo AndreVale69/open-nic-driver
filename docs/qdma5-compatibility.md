@@ -187,12 +187,13 @@ which one applies can only be decided on hardware:
    * budget 0 (netpoll): skb TX completions only, no RX, XDP or page pool.
 
    With the CIDX returned every poll, the QDMA can have at most the posted
-   RX descriptors (the driver keeps 128 to 383 posted) plus one poll (64) of
+   RX descriptors (at most 383 after refill) plus one poll (64) of
    completions outstanding, well below 1022, so the ring cannot overflow
    while every completion uses a descriptor (packets up to the 4 KiB
-   buffer). More traffic than a queue takes is dropped by the QDMA for lack
-   of a descriptor instead (`0xB10` counter), and the queue keeps working;
-   the event loop checks this for every case.
+   buffer). Hardware can consume all posted descriptors between polls.
+   A transfer that needs another descriptor then waits for refill. Packet
+   loss during this interval depends on available upstream buffering and
+   whether the source can wait. [AMD PG302, C2H Stream Engine](https://docs.amd.com/r/5.0-English/pg302-qdma/C2H-Stream-Engine)
 
    Interrupts: the CIDX update carries an interrupt request (`irq_en_wrb`),
    but the completion context is programmed with `full_upd` = 0 (as REF does
@@ -257,10 +258,11 @@ Design notes:
 | Upstream `3de2269` on kernel 7.0 | **fails**: `onic_main.c:236 assignment from pointer to non-enclosed address space` (host-kernel issue, fixed in `a581c62`) |
 | `make` (kernel module, `-Werror`) | passes |
 | `make W=1` (with the normal `-Werror`) | passes (failed at `ec13b07` on the unused `tx_ring`) |
-| `make -C tests check` | `test_qdma` 284 checks, `test_rx_poll` 4658 (the event loop checks every poll), `test_hw` 68, `test_reg_dump.py` 9 tests: 0 failures |
+| `make -C tests check` | `test_qdma` 284 checks, `test_rx_poll` 5742 (the event loop checks every poll), `test_hw` 68, `test_reg_dump.py` 9 tests: 0 failures |
 | `make -C tests check-asan` (ASan + UBSan + LeakSanitizer) | same, 0 failures, no leaks |
 | New tests against the `ec13b07` sources | `test_rx_poll`: 54 failures. Full budget writes no CIDX and calls `napi_complete()` + `napi_schedule()`; budget 0 processes a packet and returns an XDP frame; in the PG302 event loop at 64 and 100 arrivals per poll the ring overflows, the context is invalidated and the queue is lost (1022 of 19200 delivered); an skb failure leaves NAPI scheduled forever. `test_hw`: UBSan stops on a member access through a NULL `struct qdma_dev` (`qdma_context.c:446`) after the FMAP timeout; a stuck CMAC reset never returns |
-| Event loop, this branch (300 rounds, both `full_upd` settings) | no overflow, nothing lost, NAPI idle and every completion handed back at the end; `full_upd` = 0: about one interrupt per poll under load, `full_upd` = 1: one per burst |
+| Event loop, this branch (300 rounds, both `full_upd` settings) | all 30,000 delivered after draining with a retaining source. With a 64-packet upstream buffer at the same load, 10,636 dropped at that buffer. Both cases drained and delivered fresh traffic with zero completion-ring overflows. `full_upd` = 0: about one interrupt per poll under load, `full_upd` = 1: one per burst |
+| Two-queue open and stop | Failing the second RX queue releases the DMA allocations. Reopening schedules both RX pollers. On stop, both pollers are disabled before TX queue cleanup. |
 | Mutation check (QDMA 4.0 constant, QDMA 5.0 fence bit, ops selection) | all three detected |
 | `tools/qdma_check_regs.py` against CSV4 and CSV5 | OK 138, SUBSET 4, LEGACY 20 (14 field layouts, 6 known error-mask bits), unexpected 0; an added undefined mask bit and the old H2C-ST bit 11 each fail it |
 | `tools/qdma_reg_dump.py --resource` on BAR images programmed by the driver code | 0 mismatches for every generation x `0xBE0` in {8 .. 128, with MAX_STBUF} x `0xBE4` in {16, 32, 128}; wrong programming, no magic and a hand-edited `0x158` are flagged. The `ec13b07` dump flagged a correct depth-16 image |
@@ -393,6 +395,13 @@ and `QDMA_GLBL_ERR_STAT` (`0x248`), `C2H_ERR_STAT` (`0xAF0`),
 
 ### 6.5 Repeated initialisation and reset (root)
 
+Stop the traffic generators on both ends and allow outstanding traffic to
+drain before cycling the interface or unloading the driver. The OpenNIC
+shell ties the C2H stream marker low in `qdma_subsystem_c2h.sv`. The
+driver therefore has no marker completion to confirm that the device
+pipeline has drained. These cycles qualify idle shutdown only. [AMD PG302,
+queue teardown](https://docs.amd.com/r/5.0-English/pg302-qdma/Queue-Teardown?contentId=YG95oU6yKHT33InzHoZSpg)
+
 ```bash
 for i in $(seq 50); do
   sudo rmmod onic && sudo insmod ./onic.ko qdma_ip_override=<n> || break
@@ -420,15 +429,28 @@ collapse to 0; `C2H_ERR_STAT` bits 13 (`wrb_qfull_err`) and 14
 (`wrb_cidx_err`) stay 0; the interface still pings afterwards without a
 reload. Record offered and received load, not only the receiver side.
 
-If it stalls: before reloading anything, save `dmesg`, `/proc/interrupts`,
-`ip -s link` (`rx_errors` counts completions with the error bit) and a
-`qdma_reg_dump.py` run, then stop the generator and send one ping to see if
-the queue recovers on its own. A `wrb_qfull_err` means the queue's
-completion context has been invalidated (PG302): that queue receives
-nothing until the interface goes down and up. Loss without a stall is
-different: compare the C2H counters in two dumps; `0xB10`
-(`DESC_RSP_DROP_ACCEPTED`) counts packets dropped because no RX descriptor
-was posted, which this driver allows beyond 128 to 383 descriptors.
+For each PF, snapshot `ethtool -S <iface>`, `ip -s link show <iface>`,
+`/proc/interrupts`, and the QDMA register dump before and after the load.
+Use sequence-numbered inbound traffic and save sender counts and receiver
+sequence gaps. Compare the `stat_adapt_rx_recv`, `stat_adapt_rx_drop`,
+and `stat_adapt_rx_error` deltas with host RX counts and the IRQ deltas for
+the loaded queues. Adapter drops during a gap localize loss to the ingress
+path. IRQ counts alone do not measure packet progress during NAPI polling.
+
+If RX stops, save those snapshots and `dmesg` before cycling the interface.
+Record the first-error queue ID and status. If queue-context diagnostics
+are available, capture the affected completion context's valid and error
+fields before resetting it. The BAR register dump reads global status
+and does not issue indirect queue-context commands. Stop the load, let
+the receiver drain, then send a canary on the same flow. Recovery after
+draining is consistent with temporary backpressure. A latched
+`wrb_qfull_err`, an invalid completion context, and failure of the canary
+on that queue point to completion-ring overflow.
+
+BAR0 `0xB10` counts accepted descriptor responses carrying a drop
+indication when the counter is implemented. The reviewed two-port v5 image
+configuration specifies `C_DBG_EN=DEBUG_NONE`. A zero reading cannot rule
+out descriptor starvation. [AMD QDMA v5 register map](https://www.xilinx.com/support/documents/ip_documentation/qdma/v5_0/qdma-v5-0-register-map.zip)
 
 ### 6.7 Interpreting the A/B matrix
 
@@ -457,9 +479,9 @@ was posted, which this driver allows beyond 128 to 383 descriptors.
 * The leaf error enable masks are the QDMA 3.x ones on 4.0 and 5.0
   (section 2): some 4.0/5.0 error sources never raise the error interrupt.
   Their status bits still latch; `qdma_reg_dump.py` shows them.
-* RX keeps only 128 to 383 of the 1023 descriptors posted (refill by 256
-  below 128), so a burst larger than that between two polls is dropped by
-  the QDMA (`0xB10`). A throughput limit, not a stall.
+* RX refills in batches of 256 when fewer than 128 descriptors remain.
+  Delayed polling can exhaust posted descriptors and stall C2H transfers
+  until refill. Section 6.6 covers measuring ingress loss during the stall.
 * The completion context has `full_upd` = 0, so the interrupt requests in
   the CIDX updates are ignored and the QDMA can interrupt once per poll
   under load (section 3). `full_upd` = 1 would make them count; to be tried
@@ -478,7 +500,5 @@ was posted, which this driver allows beyond 128 to 383 descriptors.
   next interrupt, which runs an XDP program on that packet again.
 * `onic_rx_poll()` reads completion entries after the status PIDX without a
   `dma_rmb()`: fine on x86, not on weakly ordered CPUs.
-* `onic_clear_rx_queue()` frees the RX buffers with the completion ring's
-  count; it equals the descriptor ring's (1024) today.
 * No FLR or device reset recovery: a card reset or re-enumeration needs the
   module reloaded.

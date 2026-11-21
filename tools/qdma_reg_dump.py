@@ -204,13 +204,14 @@ def decode_status(off, val):
     return names
 
 
-# Read-only C2H counters (same in 4.0 and 5.0): packets and completions the
-# QDMA took from the shell, and packets dropped because no descriptor was
-# posted.  Compare them before and after a traffic phase.
+# Read-only C2H counters. 0xB10 counts accepted descriptor responses with
+# the drop indication. Its availability depends on the IP debug configuration.
 COUNTERS = {0x0A88, 0x0A8C, 0x0A90, 0x0B10, 0x0B14, 0x0BC0}
 
 
 def decode_other(off, val):
+    if off == 0x0B10:
+        return "count %d (debug-dependent, drop-marked descriptor responses)" % val
     if off in COUNTERS:
         return "count %d" % val
     if off == 0x0B04:

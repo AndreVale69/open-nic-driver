@@ -25,6 +25,8 @@ typedef u16 __be16;
 
 #define likely(x)			__builtin_expect(!!(x), 1)
 #define unlikely(x)			__builtin_expect(!!(x), 0)
+#define smp_load_acquire(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define smp_store_release(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
 #define READ_ONCE(x)			(x)
 #define xchg(p, v)			({ __typeof__(*(p)) __old = *(p); *(p) = (v); __old; })
 #define container_of(ptr, type, member)	((type *)((char *)(ptr) - offsetof(type, member)))
@@ -339,7 +341,10 @@ void napi_schedule(struct napi_struct *n);
 void shim_napi_irq(struct napi_struct *n);
 int napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb);
 static inline void netif_tx_start_all_queues(struct net_device *dev) { }
-static inline void netif_tx_stop_all_queues(struct net_device *dev) { }
+static inline void synchronize_net(void) { }
+static inline void synchronize_irq(int irq) { }
+static inline int pci_irq_vector(struct pci_dev *p, int i) { return i; }
+static inline void netif_tx_disable(struct net_device *dev) { }
 static inline void netif_carrier_on(struct net_device *dev) { }
 static inline void netif_carrier_off(struct net_device *dev) { }
 static inline bool netif_running(const struct net_device *dev) { return true; }

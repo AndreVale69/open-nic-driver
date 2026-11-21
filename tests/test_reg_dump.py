@@ -158,7 +158,7 @@ class RegDumpTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         line = [l for l in out.splitlines() if l.startswith("0x00B10 ")][0]
         self.assertIn("QDMA_C2H_STAT_DESC_RSP_DROP_ACCEPTED", line)
-        self.assertTrue(line.endswith("count 1234"), line)
+        self.assertIn("count 1234 (debug-dependent, drop-marked descriptor responses)", line)
 
 
 if __name__ == "__main__":

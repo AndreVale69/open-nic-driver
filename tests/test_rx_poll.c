@@ -69,7 +69,7 @@ static struct {
 	u16 desc_pidx;		/* C2H descriptor PIDX written by the driver */
 	u16 desc_used;		/* descriptors the QDMA has filled */
 	int produced;
-	int nodesc;		/* packets dropped for lack of a descriptor */
+	int stalls;		/* offers blocked by descriptor exhaustion */
 	int lost;		/* completions dropped by an invalid context */
 	int irqs;
 } hw;
@@ -87,6 +87,10 @@ static void hw_eval_irq(void)
 	shim_napi_irq(&rxq->napi);	/* onic_q_handler() */
 }
 
+static int fail_rx_qid = -1;
+static struct onic_private priv;
+static bool inspect_shutdown;
+
 /* stubs for the onic_hardware.c functions used by onic_netdev.c */
 u16 onic_ring_count(u8 idx)
 {
@@ -102,10 +106,20 @@ int onic_qdma_init_tx_queue(unsigned long qdma, u16 qid,
 int onic_qdma_init_rx_queue(unsigned long qdma, u16 qid,
 			    const struct onic_qdma_c2h_param *param)
 {
-	return 0;
+	return qid == fail_rx_qid ? -ENOMEM : 0;
 }
 
-void onic_qdma_clear_tx_queue(unsigned long qdma, u16 qid) { }
+void onic_qdma_clear_tx_queue(unsigned long qdma, u16 qid)
+{
+	int i;
+
+	if (inspect_shutdown) {
+		CHECK(!priv.queues_ready, "IRQ and XDP entry points gated");
+		for (i = 0; i < priv.num_rx_queues; ++i)
+			CHECK(!priv.rx_queue[i] || !priv.rx_queue[i]->napi.enabled,
+			      "RX poll %d disabled before clearing TX %d", i, qid);
+	}
+}
 void onic_qdma_clear_rx_queue(unsigned long qdma, u16 qid) { }
 void onic_set_tx_head(unsigned long qdma, u16 qid, u16 head) { }
 
@@ -138,7 +152,6 @@ void onic_qdma_clear_error_interrupt(unsigned long qdma)
 
 static struct pci_dev pdev;
 static struct net_device ndev;
-static struct onic_private priv;
 static struct rtnl_link_stats64 stats;
 static struct bpf_prog xdp_prog;
 static u16 real_cmpl;		/* usable completion entries */
@@ -170,6 +183,9 @@ static void setup(void)
 	real_desc = rxq->desc_ring.count - 1;
 	CHECK(rxq->napi.poll != NULL, "NAPI poll registered");
 
+	/* Run the startup poll that catches interrupts during queue setup. */
+	CHECK(rxq->napi.sched, "startup poll scheduled");
+	CHECK_EQ(rxq->napi.poll(&rxq->napi, 64), 0, "empty startup poll");
 	hw.color = 1;
 	shim.nev = 0;		/* forget the doorbells written at open */
 }
@@ -202,7 +218,7 @@ static int hw_produce_err(int n, int len, int err)
 			break;
 		}
 		if (hw.limit_desc && hw.desc_used == hw.desc_pidx) {
-			hw.nodesc += n - i;	/* no buffer, no completion */
+			hw.stalls++;	/* source retains the unaccepted packets */
 			break;
 		}
 		if ((hw.pidx + 1) % real_cmpl == hw.cidx) {
@@ -542,9 +558,9 @@ static void napi_run(int max_polls)
 }
 
 static void run_model(bool full_upd, int per_round, int polls_per_round,
-		      int rounds, const char *what)
+		      int rounds, int buffer_capacity, const char *what)
 {
-	int r, offered = 0;
+	int r, offered = 0, pending = 0, ingress_drops = 0;
 
 	setup();
 	hw.model = true;
@@ -553,19 +569,38 @@ static void run_model(bool full_upd, int per_round, int polls_per_round,
 	hw.limit_desc = true;	/* hw.desc_pidx: written by the driver at open */
 
 	for (r = 0; r < rounds; r++) {
-		hw_produce(per_round, 64);
 		offered += per_round;
+		pending += per_round;
+		pending -= hw_produce(pending, 64);
+		/* Capacity is the source's waiting space after this offer. */
+		if (pending > buffer_capacity) {
+			ingress_drops += pending - buffer_capacity;
+			pending = buffer_capacity;
+		}
 		napi_run(polls_per_round);
 	}
-	/* traffic stops; let the interrupts and NAPI settle */
-	for (r = 0; r < 200 && rxq->napi.sched; r++)
+	/* Stop new arrivals. Retry queued packets as the driver posts buffers.
+	 * Bound the loop so a missed interrupt or refill fails the test.
+	 */
+	for (r = 0; r <= offered && (pending || rxq->napi.sched); r++) {
+		int produced = pending ? hw_produce(pending, 64) : 0;
+
+		pending -= produced;
+		if (!produced && !rxq->napi.sched)
+			break;
 		napi_run(polls_per_round);
+	}
+	CHECK_EQ(pending, 0, what);
 
 	CHECK(!hw.invalid && hw.qfull == 0,
 	      "%s: completion ring overflowed (%d), context invalidated", what,
 	      hw.qfull);
 	CHECK_EQ(hw.lost, 0, what);
-	CHECK_EQ(hw.produced + hw.nodesc, offered, what);
+	CHECK_EQ(hw.produced + ingress_drops, offered, what);
+	if (buffer_capacity >= offered)
+		CHECK_EQ(hw.produced, offered, what);
+	else
+		CHECK(ingress_drops > 0, "%s: finite source buffer did not fill", what);
 	CHECK_EQ(stats.rx_packets, hw.produced, what);
 	CHECK(!rxq->napi.sched, "%s: NAPI still scheduled after traffic", what);
 	CHECK(hw.cidx == hw.pidx, "%s: completions not handed back (%u/%u)", what,
@@ -574,11 +609,11 @@ static void run_model(bool full_upd, int per_round, int polls_per_round,
 	CHECK(hw.irqs > 0, "%s: no interrupt", what);
 	check_no_legacy_napi_calls(what);
 	if (getenv("TEST_VERBOSE"))
-		printf("  %-40s polls %4d irqs %5d nodesc %5d\n", what,
-		       shim_count(SHIM_EV_CMPL_CIDX), hw.irqs, hw.nodesc);
+		printf("  %-40s polls %4d irqs %5d stalls %5d ingress drops %5d\n", what,
+		       shim_count(SHIM_EV_CMPL_CIDX), hw.irqs, hw.stalls, ingress_drops);
 
 	/* and the queue still works afterwards */
-	hw_produce(10, 64);
+	CHECK_EQ(hw_produce(10, 64), 10, "fresh packets accepted");
 	napi_run(4);
 	CHECK_EQ(stats.rx_packets, hw.produced, what);
 	CHECK(!rxq->napi.sched && hw.cidx == hw.pidx, "%s: not idle again", what);
@@ -587,15 +622,10 @@ static void run_model(bool full_upd, int per_round, int polls_per_round,
 
 static void test_event_loop(void)
 {
-	/*
-	 * The driver keeps only 128 to 383 descriptors posted (refill by 256
-	 * below 128), so a burst larger than that between polls drops at the
-	 * descriptors even when the polls could take it.
-	 */
 	static const struct {
 		int per_round;
 		int polls;
-		bool drops;
+		bool stalls;
 	} cases[] = {
 		{ 48, 1, false },	/* below one poll per round */
 		{ 64, 1, false },	/* exactly one budget: the old code overflowed */
@@ -609,17 +639,41 @@ static void test_event_loop(void)
 		for (c = 0; c < ARRAY_SIZE(cases); c++) {
 			snprintf(what, sizeof(what), "full_upd=%d, %d per round, %d poll(s)",
 				 f, cases[c].per_round, cases[c].polls);
-			run_model(f, cases[c].per_round, cases[c].polls, 300, what);
-			if (cases[c].drops)
-				CHECK(hw.nodesc > 0, "%s: drops at the descriptors", what);
+			run_model(f, cases[c].per_round, cases[c].polls, 300, 300 * cases[c].per_round, what);
+			if (cases[c].stalls)
+				CHECK(hw.stalls > 0, "%s: descriptor starvation expected", what);
 			else
-				CHECK_EQ(hw.nodesc, 0, what);
+				CHECK_EQ(hw.stalls, 0, what);
 		}
+		snprintf(what, sizeof(what), "full_upd=%d, finite 64-packet source buffer", f);
+		run_model(f, 100, 1, 300, 64, what);
 	}
+}
+
+static void test_queue_lifecycle(void)
+{
+	setup();
+	teardown();
+	inspect_shutdown = true;
+	priv.num_rx_queues = 2;
+	priv.num_tx_queues = 2;
+	priv.num_q_vectors = 2;
+	fail_rx_qid = 1;
+	CHECK_EQ(onic_open_netdev(&ndev), -ENOMEM, "second RX queue fails");
+	CHECK_EQ(shim.dma_allocs, 0, "partial open frees DMA allocations");
+	CHECK(!priv.queues_ready, "failed open leaves queue IRQs gated");
+	CHECK_EQ(onic_xdp_xmit(&ndev, 0, NULL, 0), -ENETDOWN, "XDP while down");
+	fail_rx_qid = -1;
+	CHECK_EQ(onic_open_netdev(&ndev), 0, "retry open");
+	CHECK(priv.rx_queue[0]->napi.sched && priv.rx_queue[1]->napi.sched,
+	      "startup schedules both RX queues");
+	teardown();
+	inspect_shutdown = false;
 }
 
 int main(void)
 {
+	test_queue_lifecycle();
 	test_empty_poll_rearms();
 	test_partial_batch();
 	test_full_budget_hands_back_cidx();

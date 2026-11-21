@@ -28,12 +28,9 @@ static irqreturn_t onic_q_handler(int irq, void *dev_id)
 	struct onic_q_vector *vec = dev_id;
 	struct onic_private *priv = vec->priv;
 	u16 qid = vec->vid;
-	struct onic_rx_queue *rxq = priv->rx_queue[qid];
-	bool debug = 0;
-	if (debug) dev_info(&priv->pdev->dev, "queue irq");
-
-	//napi_schedule(&rxq->napi);
-	napi_schedule_irqoff(&rxq->napi);
+	/* MSI-X vectors outlive the queues across interface down/up. */
+	if (smp_load_acquire(&priv->queues_ready) && qid < priv->num_rx_queues)
+		napi_schedule_irqoff(&priv->rx_queue[qid]->napi);
 	return IRQ_HANDLED;
 }
 

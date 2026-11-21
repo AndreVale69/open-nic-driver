@@ -1,2 +1,6 @@
 /test_qdma
 /test_qdma_asan
+/test_rx_poll
+/test_rx_poll_asan
+/test_hw
+/test_hw_asan

@@ -15,6 +15,7 @@
  * the file called "COPYING".
  */
 #include <linux/delay.h>
+#include <linux/jiffies.h>
 #include <linux/pci.h>
 
 #include "onic_hardware.h"
@@ -26,7 +27,7 @@
 #include "qdma_error_info.h"
 
 #define RX_ALIGN_TIMEOUT_MS			1000
-#define CMAC_RESET_WAIT_MS			1
+#define CMAC_RESET_TIMEOUT_MS			1000
 
 /* 0 = detect from QDMA_GLBL2_MISC_CAP, 4 = QDMA 4.0 programming,
  * 5 = QDMA 5.0 programming
@@ -92,20 +93,39 @@ static int qdma_select_hw(struct qdma_dev *qdev, struct device *dev)
 	return 0;
 }
 
+/**
+ * onic_wait_shell_status - wait until all @mask bits are set in shell status
+ * @hw: pointer to hardware
+ * @mask: status bits to wait for
+ *
+ * Returns 0, or -ETIMEDOUT after CMAC_RESET_TIMEOUT_MS.  The wait used to be
+ * unbounded, which hung the probe (busy loop, no rmmod) on an image whose
+ * reset never completes.
+ **/
+static int onic_wait_shell_status(struct onic_hardware *hw, u32 mask)
+{
+	unsigned long timeout = jiffies + msecs_to_jiffies(CMAC_RESET_TIMEOUT_MS);
+
+	for (;;) {
+		if ((onic_read_reg(hw, SYSCFG_OFFSET_SHELL_STATUS) & mask) == mask)
+			return 0;
+		if (time_after(jiffies, timeout))
+			return -ETIMEDOUT;
+		usleep_range(1000, 2000);
+	}
+}
+
 static int onic_enable_cmac(struct onic_hardware *hw, u8 cmac_id)
 {
+	u32 reset_mask;
+
 	if (cmac_id != 0 && cmac_id != 1)
 		return -EINVAL;
 
-	if (cmac_id == 0) {
-		onic_write_reg(hw, SYSCFG_OFFSET_SHELL_RESET, 0x10);
-		while ((onic_read_reg(hw, SYSCFG_OFFSET_SHELL_STATUS) & 0x10) != 0x10)
-			mdelay(CMAC_RESET_WAIT_MS);
-	} else {
-		onic_write_reg(hw, SYSCFG_OFFSET_SHELL_RESET, 0x100);
-		while ((onic_read_reg(hw, SYSCFG_OFFSET_SHELL_STATUS) & 0x100) != 0x100)
-			mdelay(CMAC_RESET_WAIT_MS);
-	}
+	reset_mask = (cmac_id == 0) ? 0x10 : 0x100;
+	onic_write_reg(hw, SYSCFG_OFFSET_SHELL_RESET, reset_mask);
+	if (onic_wait_shell_status(hw, reset_mask))
+		return -ETIMEDOUT;
 
     if (hw->RS_FEC) {
 		/* Enable RS-FEC for CMACs with RS-FEC implemented */
@@ -158,16 +178,14 @@ int onic_init_hardware(struct onic_private *priv)
 
 	/* QDMA IP registers uses BAR-0 */
 	qdev = qdma_create_dev(pdev, 0);
-	if (!qdev)
-		return -ENOMEM;
+	if (!qdev) {
+		rv = -ENOMEM;
+		goto unmap_shell;
+	}
 
 	rv = qdma_select_hw(qdev, &pdev->dev);
-	if (rv < 0) {
-		qdma_destroy_dev(qdev);
-		pci_iounmap(pdev, hw->addr);
-		hw->addr = NULL;
-		return rv;
-	}
+	if (rv < 0)
+		goto destroy_qdma;
 
 	func_id = PCI_FUNC(pdev->devfn);
 	qbase = func_id * ONIC_MAX_QUEUES;
@@ -179,10 +197,10 @@ int onic_init_hardware(struct onic_private *priv)
 	fmap_ctxt.qmax = qmax;
 	rv = qdma_clear_fmap_ctxt(qdev);
 	if (rv < 0)
-		goto clear_hardware;
+		goto fmap_failed;
 	rv = qdma_write_fmap_ctxt(qdev, &fmap_ctxt);
 	if (rv < 0)
-		goto clear_hardware;
+		goto fmap_failed;
 
 	/* inform shell about the function map */
 	val = (FIELD_SET(QDMA_FUNC_QCONF_QBASE_MASK, qbase) |
@@ -207,16 +225,28 @@ int onic_init_hardware(struct onic_private *priv)
 		val = onic_read_reg(hw, CMAC_OFFSET_CORE_VERSION(i));
 		if (val != ONIC_CMAC_CORE_VERSION)
 			break;
-		if (master_pf)
-			onic_enable_cmac(hw, i);
+		if (master_pf && onic_enable_cmac(hw, i) < 0)
+			dev_warn(&pdev->dev,
+				 "CMAC %d: shell reset not done after %d ms, port not enabled",
+				 i, CMAC_RESET_TIMEOUT_MS);
 	}
 	hw->num_cmacs = i;
 	dev_info(&pdev->dev, "Number of CMAC instances = %d", hw->num_cmacs);
 
 	return 0;
 
-clear_hardware:
-	onic_clear_hardware(priv);
+	/*
+	 * hw->qdma is still unset on these paths, so unwind here instead of
+	 * calling onic_clear_hardware(), which would use a NULL QDMA handle.
+	 */
+fmap_failed:
+	dev_err(&pdev->dev, "QDMA function map programming failed, err = %d",
+		rv);
+destroy_qdma:
+	qdma_destroy_dev(qdev);
+unmap_shell:
+	pci_iounmap(pdev, hw->addr);
+	hw->addr = NULL;
 	return rv;
 }
 
@@ -228,12 +258,16 @@ void onic_clear_hardware(struct onic_private *priv)
 	u16 func_id = PCI_FUNC(pdev->devfn);
 
 	/* clear the function map in shell */
-	onic_write_reg(hw, QDMA_FUNC_OFFSET_QCONF(func_id), 0);
+	if (hw->addr)
+		onic_write_reg(hw, QDMA_FUNC_OFFSET_QCONF(func_id), 0);
 
-	qdma_invalidate_fmap_ctxt(qdev);
-	qdma_destroy_dev(qdev);
+	if (qdev) {
+		qdma_invalidate_fmap_ctxt(qdev);
+		qdma_destroy_dev(qdev);
+	}
 
-	pci_iounmap(pdev, hw->addr);
+	if (hw->addr)
+		pci_iounmap(pdev, hw->addr);
 
 	memset(hw, 0, sizeof(struct onic_hardware));
 }

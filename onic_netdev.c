@@ -542,17 +542,8 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 		cmpl_ptr = cmpl_ring->desc +
 			   (QDMA_C2H_CMPL_SIZE * cmpl_ring->next_to_clean);
 
-		if ((++work) >= budget) {
-			if (xdp_xmit & ONIC_XDP_REDIR)
-					xdp_do_flush();
-			if (debug)
-				netdev_info(q->netdev,
-					    "watchdog work %u, budget %u", work,
-					    budget);
-			napi_complete(napi);
-			napi_schedule(napi);
-			goto out_of_budget;
-		}
+		if (++work >= budget)
+			break;
 
 		qdma_unpack_c2h_cmpl(&cmpl, cmpl_ptr);
 
@@ -567,45 +558,51 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 	if (xdp_xmit & ONIC_XDP_REDIR)
 		xdp_do_flush();
 
-	if (cmpl_ring->next_to_clean == cmpl_stat.pidx) {
-		if (debug)
-			netdev_info(
-				q->netdev,
-				"next_to_clean == cmpl_stat.pidx %u, napi_complete work %u, budget %u, rval %s",
-				cmpl_stat.pidx, work, budget,
-				napi_cmpl_rval ? "true" : "false");
-		napi_cmpl_rval = napi_complete_done(napi, work);
+	/*
+	 * Give the consumed completion entries back to the QDMA on every poll.
+	 * The QDMA only sees the CIDX written here.  It used to be written
+	 * only by a poll that drained the ring up to its starting PIDX, so
+	 * under sustained traffic a series of full-budget polls returned no
+	 * completion credit and the QDMA side of the ring could fill up.
+	 *
+	 * Budget used up: more completions may be pending.  Publish the CIDX,
+	 * requesting no interrupt, and return the full budget so that the NAPI
+	 * core polls again.  The NAPI state must not be changed here.
+	 *
+	 * The interrupt request (irq_en_wrb) only takes effect with full_upd
+	 * set in the completion context.  It is clear here, as in AMD's driver
+	 * without adaptive RX, so the QDMA copies only the CIDX from the update
+	 * (PG302, completion context) and takes any CIDX update as servicing
+	 * its outstanding interrupt, then re-evaluates the trigger conditions.
+	 * An interrupt that arrives while this NAPI still runs just marks it
+	 * missed, and napi_complete_done() then keeps it scheduled.
+	 */
+	if (work >= budget) {
 		onic_set_completion_tail(priv->hw.qdma, qid,
-					 cmpl_ring->next_to_clean, 1);
-		if (debug)
-			netdev_info(q->netdev, "onic_set_completion_tail ");
-	} else if (cmpl_ring->next_to_clean == 0) {
-		if (debug)
-			netdev_info(
-				q->netdev,
-				"next_to_clean == 0, napi_complete work %u, budget %u, rval %s",
-				work, budget,
-				napi_cmpl_rval ? "true" : "false");
+					 cmpl_ring->next_to_clean, 0);
 		if (debug)
 			netdev_info(q->netdev,
-				    "napi_complete work %u, budget %u, rval %s",
-				    work, budget,
-				    napi_cmpl_rval ? "true" : "false");
-		napi_cmpl_rval = napi_complete_done(napi, work);
-		onic_set_completion_tail(priv->hw.qdma, qid,
-					 cmpl_ring->next_to_clean, 1);
-		if (debug)
-			netdev_info(q->netdev, "onic_set_completion_tail ");
+				    "rx_poll budget %d used, cidx %u", budget,
+				    cmpl_ring->next_to_clean);
+		return budget;
 	}
 
-out_of_budget:
-	if (debug)
-		netdev_info(q->netdev, "rx_poll is done");
+	/*
+	 * Below budget: either all completions seen at the start of this poll
+	 * are consumed, or one could not be processed (it stays pending and
+	 * the next interrupt retries it).  Request the interrupt only if NAPI
+	 * really completed; otherwise (busy polling, deferred IRQs, missed
+	 * event) the core polls again and that poll requests it.
+	 */
+	napi_cmpl_rval = napi_complete_done(napi, work);
+	onic_set_completion_tail(priv->hw.qdma, qid, cmpl_ring->next_to_clean,
+				 napi_cmpl_rval ? 1 : 0);
 	if (debug)
 		netdev_info(
 			q->netdev,
-			"rx_poll returning work %u, rx_packets %lld, rx_bytes %lld",
-			work, pcpu_stats_pointer->rx_packets,
+			"rx_poll returning work %u, cidx %u, armed %d, rx_packets %lld, rx_bytes %lld",
+			work, cmpl_ring->next_to_clean, napi_cmpl_rval,
+			pcpu_stats_pointer->rx_packets,
 			pcpu_stats_pointer->rx_bytes);
 	return work;
 }
